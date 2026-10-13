@@ -1,0 +1,30 @@
+{
+  "name": "meus-gastos",
+  "version": "1.0.0",
+  "description": "Controle financeiro local do casal por WhatsApp e dashboard",
+  "private": true,
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node bot.mjs",
+    "dashboard": "node dashboard.mjs",
+    "build": "node scripts/build-motion.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:ui": "playwright test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "motion": "14.1.0",
+    "pino": "9.6.0",
+    "qrcode-terminal": "0.12.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "esbuild": "0.28.2"
+  }
+}
