@@ -8,9 +8,9 @@ O projeto transforma comandos de texto em gastos, aportes, salários e faturas a
 
 - Registro de gastos por descrição e valor, enviado no grupo configurado.
 - Registro de aportes com `investimento`, `aporte` e `reserva`, separados dos gastos.
-- Salário mensal e fatura mensal, separados por pessoa e mês.
-- Visões individuais e do casal, com seleção do mês de referência.
-- Gráficos de evolução dos gastos, distribuição por descrição e comparação entre pessoas.
+- Recebimentos de salário e lançamentos de fatura acumuláveis, separados por pessoa e mês.
+- Telas Resumo, Semanal, Mensal, Lançamentos e Planejamento, com filtros individuais e do casal e navegação inferior no celular.
+- Evolução dos gastos, roscas por categoria com legenda, reais e percentuais e comparação entre períodos.
 - Limite de gastos e meta de aportes para o casal ou para cada pessoa, por mês.
 - Histórico com busca por descrição ou pessoa, filtro por tipo e carregamento de mais registros.
 - Inclusão, edição e exclusão de lançamentos pela dashboard; gestão dos salários e faturas mensais.
@@ -29,7 +29,9 @@ Os valores são armazenados em centavos inteiros. Gastos e aportes precisam ser 
 
 ### Salário e fatura mensal
 
-Existe um valor de cada tipo por **pessoa e mês**. Repetir `salario` ou `cartao` para a mesma pessoa e o mesmo mês **atualiza o valor existente, sem acumular**. Esses valores não são copiados automaticamente para os meses seguintes.
+Cada comando `salario`, `cartao` ou `fatura` adiciona um **lançamento individual** à pessoa e ao mês. `salario 2000` seguido de `salario 800` totaliza R$ 2.800; `fatura 500` seguido de `fatura 300` totaliza R$ 800. Mensagens diferentes com o mesmo valor são lançamentos distintos. Reprocessar a mesma mensagem não duplica o lançamento, mesmo depois de editar ou excluir o item na dashboard. Os valores não são copiados automaticamente para outros meses.
+
+Em Planejamento, o botão **Adicionar** soma um novo item; **Editar** altera apenas o lançamento escolhido, identificado por ID. Cada item pode ser excluído separadamente. Uma descrição opcional identifica a origem ou o cartão. A data pode ficar em branco quando só o mês é conhecido; a dashboard não atribui esses itens a uma semana.
 
 `R$ 0,00` é um valor informado. A ausência de cadastro é mostrada como “não informado” ou um traço. Essa distinção também aparece na exportação dos valores mensais. Salários e faturas podem ser editados ou removidos pela dashboard.
 
@@ -54,8 +56,8 @@ Envie os comandos no grupo escolhido durante a configuração, a partir de uma d
 | Registrar gasto | `mercado 107,87`, `farmácia 40`, `transporte R$ 25,50` |
 | Registrar aporte | `investimento CDB 200`, `aporte 150` |
 | Registrar reserva | `reserva 200`, `reserva emergência 150,50` |
-| Informar ou atualizar salário | `salario 3000`, `salário 2026-10 3000` |
-| Informar ou atualizar fatura | `cartao 850,90`, `cartão 2026-10 850,90` |
+| Adicionar recebimento | `salario 2000`, `salario 800`, `salário 2026-10 Empresa 3000` |
+| Adicionar fatura informativa | `cartao 850,90`, `cartão 2026-10 Visa 500`, `fatura Outro cartão 300` |
 | Consultar total de gastos e aportes | `total`, `total mês`, `total 2026-10` |
 | Consultar os últimos dez lançamentos | `listar`, `listar mês`, `listar 2026-10` |
 | Remover o próprio último gasto ou aporte | `desfazer` |
@@ -63,7 +65,21 @@ Envie os comandos no grupo escolhido durante a configuração, a partir de uma d
 
 Sem mês explícito, os comandos mensais e as consultas usam o mês da mensagem no fuso `America/Sao_Paulo`. O formato de mês é `AAAA-MM`. Salário e fatura aceitam zero; os demais lançamentos exigem valor positivo. Os comandos mensais aceitam as formas com ou sem acento.
 
+A sintaxe é `comando [AAAA-MM] [descrição] valor`: a descrição vem antes do valor e preserva acentos. Ex.: `salario Trabalho extra R$ 800,00` e `fatura 2026-10 Visa 300`. O valor deve ser o último elemento. Um mês explícito diferente do mês da mensagem não cria uma data de ocorrência fictícia; o item permanece mensal até uma data conhecida ser informada.
+
 `total` mantém gastos e aportes separados; salário e fatura são consultados na dashboard. `desfazer` remove apenas o último gasto ou aporte de quem enviou a mensagem, e não altera salário nem fatura.
+
+## Períodos, categorias e migração
+
+A semana vai de **segunda a domingo**, inclusive, no calendário de `America/Sao_Paulo`, e pode atravessar meses e anos. A tela Semanal tem data de referência, semana anterior, próxima e atual, total de gastos, valores diários, categorias e lista filtrável. O filtro de pessoa vale para toda a tela. A seleção semanal é independente do mês das outras telas. A comparação informa ausência de gastos anteriores e não divide por zero.
+
+A tela Mensal mostra receitas, gastos, aportes, faturas informativas, metas, saldo e gastos acumulados. As composições percentuais incluem **apenas gastos**, com base no total do período e da pessoa/casal selecionados. Selecionar uma categoria na rosca mensal destaca a legenda e filtra a tela Lançamentos; na semanal, filtra a lista da própria semana. Cada legenda é um botão acessível por teclado. Períodos vazios não apresentam percentuais.
+
+Categorias são textos opcionais de até 60 caracteres, editáveis ao criar ou corrigir gastos na dashboard. Não há classificação automática: registros antigos e mensagens novas sem categoria aparecem em **Sem categoria**. Categorias já utilizadas no mês são sugeridas. Os CSVs mantêm os filtros; o CSV de salários/faturas exporta cada item com ID, descrição, data conhecida e indicação de migração.
+
+Antes de atualizar uma instalação existente, faça um backup consistente com `scripts/backup-db.mjs`. Na primeira abertura com esta versão, `openDb` executa uma migração **transacional e idempotente** (esquema 2). A antiga tabela mensal é preservada como `monthly_values_legacy_v1`; cada valor é copiado uma única vez para `monthly_values` com ID próprio, inclusive zeros, mantendo grupo, pessoa, mês, tipo, valor e o timestamp original de atualização. A migração marca o item como migrado e deixa descrição, data de ocorrência e identidade da mensagem em branco: esses dados não existiam. O registro de mensagens processadas é mantido. O histórico já substituído pela versão antiga não pode ser reconstruído.
+
+Itens migrados sem data continuam nos totais mensais; a interface informa a impossibilidade de atribuí-los a uma semana. Reabrir o banco não recopia itens editados ou excluídos. Gastos existentes recebem uma categoria inicialmente vazia, exibida como Sem categoria, sem mudar descrição, valor ou tipo. A tabela legada é um arquivo de preservação e não deve ser usada pelo código antigo: esta mudança de esquema exige planejar um eventual retorno de versão e reconciliar novos lançamentos em cópias isoladas. Nunca substitua o banco da instalação pelo banco de outro computador.
 
 ## Tecnologias
 
@@ -225,8 +241,8 @@ A origem autorizada deve ser HTTPS, estar em minúsculas, ter um hostname válid
 - Baileys é uma integração **não oficial** com WhatsApp. Mudanças do serviço, desconexões e invalidação da sessão podem exigir manutenção ou reconexão.
 - O funcionamento dos registros independe da dashboard estar aberta, mas o acesso à interface depende do servidor e da configuração de rede.
 - A versão atual foi planejada para um grupo e duas pessoas. Não oferece cadastro de múltiplos grupos, contas bancárias, login individual ou sincronização bancária.
-- As metas, o saldo e os gráficos dependem da qualidade dos dados registrados. Descrições iguais são agrupadas nos gráficos; não há classificação automática de despesas.
-- A dashboard limita a consulta a 20 mil lançamentos ativos no mês selecionado.
+- As metas, o saldo e os gráficos dependem da qualidade dos dados registrados. Categorias são definidas manualmente; não há classificação automática de despesas.
+- A dashboard limita cada período consultado a 20 mil gastos/aportes ativos, inclusive períodos anteriores usados nas comparações. Os percentuais são exibidos com uma casa decimal, podendo haver diferença de arredondamento na soma visual.
 
 ## Licença e atribuições
 

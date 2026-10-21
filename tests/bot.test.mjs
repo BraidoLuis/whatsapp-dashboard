@@ -71,16 +71,16 @@ test('reserva preserva pessoa, data e deduplicação sem virar gasto', (t) => {
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM expenses').get().n, 1);
 });
 
-test('cartão e salário atualizam sem acumular e duplicata antiga não sobrescreve atualização', (t) => {
+test('cartão e salário acumulam e mensagem repetida não cria lançamento', (t) => {
   const { db, send } = fixture(t);
   assert.match(send('cartao 850,90', { messageId: 'card-1' }), /Fatura cadastrada para Pessoa A:\nMês: 2026-10\nValor: R\$\s850,90/u);
-  assert.match(send('cartão 900', { messageId: 'card-2' }), /Fatura atualizada/u);
+  assert.match(send('cartão 900', { messageId: 'card-2' }), /Fatura cadastrada/u);
   assert.equal(send('cartao 850,90', { messageId: 'card-1' }), null);
-  assert.equal(db.prepare("SELECT amount_cents FROM monthly_values WHERE kind = 'card'").get().amount_cents, 90000);
+  assert.equal(db.prepare("SELECT SUM(amount_cents) AS amount_cents FROM monthly_values WHERE kind = 'card'").get().amount_cents, 175090);
   assert.match(send('salario 3000'), /Salário cadastrado/u);
-  assert.match(send('salário 0'), /Salário atualizado/u);
-  assert.equal(db.prepare("SELECT amount_cents FROM monthly_values WHERE kind = 'salary'").get().amount_cents, 0);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM monthly_values').get().n, 2);
+  assert.match(send('salário 0'), /Salário cadastrado/u);
+  assert.equal(db.prepare("SELECT amount_cents FROM monthly_values WHERE kind = 'salary'").get().amount_cents, 300000);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM monthly_values').get().n, 4);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM expenses').get().n, 0);
 });
 
@@ -102,7 +102,7 @@ test('valores mensais permanecem separados por pessoa, mês, grupo e tipo', (t) 
 
 test('comandos inválidos não criam valores nem gastos e a resposta também é deduplicada', (t) => {
   const { db, send } = fixture(t);
-  const invalid = ['reserva', 'reserva emergência', 'reserva -20', 'reserva 0', 'reserva 1,234', 'reserva: 200', 'reserva\n200', 'cartao', 'cartão -1', 'cartao 2026-13 10', 'cartao 2026-1 20', 'cartao outra 100', 'cartao 2026-10', 'salário', 'salario 2026-00 1000', 'salario 2026-10 -30', 'salario mil 100', 'salario 1,234', 'salario\n3000', 'aporte', 'investimento -10'];
+  const invalid = ['reserva', 'reserva emergência', 'reserva -20', 'reserva 0', 'reserva 1,234', 'reserva: 200', 'reserva\n200', 'cartao', 'cartão -1', 'cartao 2026-13 10', 'cartao 2026-1 20', 'cartao 2026-10', 'salário', 'salario 2026-00 1000', 'salario 2026-10 -30', 'salario 1,234', 'salario\n3000', 'aporte', 'investimento -10'];
   for (const text of invalid) assert.match(send(text), /Comando inválido.*\n.*Nenhum valor foi registrado/u, text);
   assert.equal(send(invalid[0], { messageId: 'test-1' }), null);
   assert.equal(send('conversa normal sem valor'), null);
@@ -181,15 +181,16 @@ test('valor mensal e deduplicação são revertidos juntos se o processamento fa
 test('helper mensal valida inteiros, preserva transação externa e restrições SQLite', (t) => {
   const { db } = fixture(t);
   const value = { groupId: 'test@g.us', actorId: personA.id, month: '2026-10', kind: 'salary', amountCents: 0 };
-  assert.deepEqual(setMonthlyValue(db, value), { created: true });
-  assert.deepEqual(setMonthlyValue(db, { ...value, amountCents: 100 }), { created: false });
+  assert.deepEqual(setMonthlyValue(db, value), { created: true, id: 1 });
+  assert.deepEqual(setMonthlyValue(db, { ...value, amountCents: 100 }), { created: true, id: 2 });
   for (const amountCents of [-1, 1.5, Number.MAX_SAFE_INTEGER, NaN]) assert.throws(() => setMonthlyValue(db, { ...value, amountCents }), /inválido/u);
   assert.throws(() => setMonthlyValue(db, { ...value, month: '2026-13' }), /inválido/u);
+  for (const date of ['2026-10-99','2026-10-1','2026-09-30',false]) assert.throws(() => setMonthlyValue(db, {...value,date}), /inválido/u);
   assert.throws(() => db.prepare('UPDATE monthly_values SET amount_cents = ?').run(1.5), /CHECK constraint/u);
   db.exec('BEGIN IMMEDIATE');
   setMonthlyValue(db, { ...value, amountCents: 200 });
   db.exec('ROLLBACK');
-  assert.equal(db.prepare('SELECT amount_cents FROM monthly_values').get().amount_cents, 100);
+  assert.equal(db.prepare('SELECT SUM(amount_cents) AS amount_cents FROM monthly_values').get().amount_cents, 100);
 });
 
 const legacySchema = `CREATE TABLE expenses (
@@ -215,7 +216,7 @@ test('migração antiga é incremental, repetível e não converte reservas por 
   db.close();
   db = openDb(path);
   try {
-    const after = db.prepare('SELECT * FROM expenses ORDER BY id').all().map(({ kind, ...row }) => { assert.equal(kind, 'expense'); return row; });
+    const after = db.prepare('SELECT * FROM expenses ORDER BY id').all().map(({ kind, category, ...row }) => { assert.equal(kind, 'expense'); assert.equal(category,null); return row; });
     assert.deepEqual(after, before);
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM processed_messages').get().n, 2);
     assert.equal(db.prepare('SELECT amount_cents FROM monthly_values').get().amount_cents, 300000);
@@ -239,4 +240,59 @@ test('falha de migração reverte todas as alterações no esquema', (t) => {
     assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name = 'monthly_values'").get(), undefined);
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM expenses').get().n, 2);
   } finally { db.close(); }
+});
+
+test('aliases e descrições mensais preservam texto, acúmulo e data real da mensagem', (t) => {
+  const { db, send } = fixture(t);
+  for (const [text, expected] of [
+    ['salario Empresa 2000', {kind:'salary',month:'2026-10',cents:200000,description:'Empresa'}],
+    ['salário 2026-09 Bônus R$ 800,00', {kind:'salary',month:'2026-09',cents:80000,description:'Bônus'}],
+    ['fatura Visa 500', {kind:'card',month:'2026-10',cents:50000,description:'Visa'}],
+    ['cartão 2026-10 Outro cartão 300', {kind:'card',month:'2026-10',cents:30000,description:'Outro cartão'}],
+  ]) assert.deepEqual(parseMonthlyValue(text,baseEvent.instant),expected);
+  send('salario 2000',{messageId:'s1'});send('salario 800',{messageId:'s2'});
+  send('fatura Visa 500',{messageId:'c1'});send('fatura Visa 500',{messageId:'c2'});
+  assert.equal(send('fatura Visa 500',{messageId:'c1'}),null);
+  const total=db.prepare('SELECT kind,SUM(amount_cents) AS cents FROM monthly_values GROUP BY kind').all();
+  assert.deepEqual(total.map(r=>[r.kind,r.cents]),[['card',100000],['salary',280000]]);
+  assert.equal(db.prepare('SELECT entry_date FROM monthly_values LIMIT 1').get().entry_date,'2026-10-12');
+  send('salario 2026-09 Empresa 100');
+  assert.equal(db.prepare("SELECT entry_date FROM monthly_values WHERE month='2026-09'").get().entry_date,null);
+  assert.equal(parseEntry('fatura 500'),null);
+  for(const text of ['fatura2026-10 500','fatura 2026-1 500','fatura -5','salario 2026-02-30 10','fatura\n500']) assert.equal(parseMonthlyValue(text),null,text);
+});
+
+test('migração mensal preserva zeros, timestamps, mês/pessoa e não ressuscita itens excluídos', (t) => {
+  const dir=mkdtempSync(join(tmpdir(),'monthly-migration-'));const path=join(dir,'legacy.sqlite');
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  let db=new DatabaseSync(path);
+  db.exec(`CREATE TABLE monthly_values (group_id TEXT,month TEXT,actor_id TEXT,kind TEXT,amount_cents INTEGER,updated_at TEXT,PRIMARY KEY(group_id,month,actor_id,kind));
+    INSERT INTO monthly_values VALUES ('test@g.us','2026-09','test-a','salary',200000,'2026-10-02T15:00:00Z'),
+    ('test@g.us','2026-09','test-b','card',0,'2026-10-03T15:00:00Z');`);
+  const before=db.prepare('SELECT * FROM monthly_values ORDER BY actor_id').all(); db.close();
+  db=openDb(path);const migrated=db.prepare('SELECT * FROM monthly_values ORDER BY actor_id').all();
+  for(let i=0;i<before.length;i++) { for(const key of Object.keys(before[i]))assert.equal(migrated[i][key],before[i][key]);
+    assert.equal(migrated[i].migrated,1);for(const key of ['description','entry_date','message_id'])assert.equal(migrated[i][key],null); }
+  db.prepare("UPDATE monthly_values SET deleted_at='removed' WHERE id=?").run(migrated[0].id);
+  const added=setMonthlyValue(db,{groupId:'test@g.us',month:'2026-09',actorId:'test-a',kind:'salary',amountCents:80000});
+  db.close();db=openDb(path);db.close();db=openDb(path);
+  try {assert.equal(db.prepare('SELECT COUNT(*) AS n FROM monthly_values').get().n,3);
+    assert.equal(db.prepare('SELECT amount_cents FROM monthly_values WHERE id=?').get(added.id).amount_cents,80000);
+    assert.equal(db.prepare('SELECT deleted_at FROM monthly_values WHERE id=?').get(migrated[0].id).deleted_at,'removed');
+    assert.equal(db.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
+  } finally {db.close();}
+});
+
+test('falha durante cópia mensal reverte rename e nova tabela', (t) => {
+  const dir=mkdtempSync(join(tmpdir(),'monthly-rollback-'));const path=join(dir,'legacy.sqlite');
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  let db=new DatabaseSync(path);
+  db.exec(`CREATE TABLE monthly_values(group_id TEXT,month TEXT,actor_id TEXT,kind TEXT,amount_cents INTEGER,updated_at TEXT);
+    INSERT INTO monthly_values VALUES ('test@g.us','2026-10','test-a','salary',-1,'old');`);db.close();
+  assert.throws(()=>openDb(path),/CHECK constraint/u);
+  db=new DatabaseSync(path);try {
+    assert.equal(db.prepare('SELECT amount_cents FROM monthly_values').get().amount_cents,-1);
+    assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name='monthly_values_legacy_v1'").get(),undefined);
+    assert.equal(db.prepare('PRAGMA table_info(monthly_values)').all().some(c=>c.name==='id'),false);
+  }finally{db.close();}
 });

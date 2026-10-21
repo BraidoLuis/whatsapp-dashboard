@@ -24,6 +24,13 @@ for (const [person, text, day] of [
 ]) add(person, text, day);
 // A historical misclassification to exercise an explicit type correction.
 db.prepare("UPDATE expenses SET kind = 'expense' WHERE description = 'Reserva antiga'").run();
+// Explicit, fictional categories demonstrate user classification (never inferred in production).
+for (const [description, category] of [
+  ['mercado','Alimentação'], ['almoço','Alimentação'], ['farmácia','Saúde'],
+  ['transporte','Mobilidade'], ['livros','Lazer'],
+]) db.prepare('UPDATE expenses SET category=? WHERE description=?').run(category,description);
+// A fictional legacy monthly amount with unknown occurrence date.
+db.prepare("UPDATE monthly_values SET entry_date=NULL,migrated=1 WHERE actor_id=? AND kind='salary'").run(config.people[0].id);
 for (const [scope, cap, goal] of [['all', 220000, 80000], ['fixture-pessoa-a', 120000, 50000], ['fixture-pessoa-b', 100000, 30000]]) {
   db.prepare('INSERT INTO monthly_goals VALUES (?, ?, ?, ?, ?, ?)')
     .run(config.groupId, '2026-10', scope, cap, goal, new Date().toISOString());

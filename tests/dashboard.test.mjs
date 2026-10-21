@@ -6,8 +6,8 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb, setMonthlyValue } from '../bot.mjs';
-import { buildState, createDashboard, validatePublicOrigin } from '../dashboard.mjs';
+import { openDb, setMonthlyValue, processText } from '../bot.mjs';
+import { buildState, createDashboard, validatePublicOrigin, weekFor, comparison } from '../dashboard.mjs';
 
 const config = {
   groupId: 'test-dashboard@g.us', groupName: 'Grupo de teste',
@@ -89,7 +89,7 @@ test('estado separa pessoas, meses, grupos, fatura e aportes; receita ausente pe
     salaryInformedCount: 1, cardInformedCount: 2, participantCount: 2, balancePartial: true,
   });
   assert.equal(all.days.reduce((sum, day) => sum + day.expenses, 0), 15_000);
-  assert.deepEqual(all.categories.map(({ label }) => label), ['Mercado', 'Transporte']);
+  assert.deepEqual(all.categories.map(({ label }) => label), ['Sem categoria']);
   assert.equal(all.monthlyValues.length, 3);
   const personA = buildState(db, config, MONTH, 'test-a');
   assert.equal(personA.summary.expenses, 10_000);
@@ -100,7 +100,7 @@ test('estado separa pessoas, meses, grupos, fatura e aportes; receita ausente pe
   assert.equal(personA.goals.spendingCap, 12_000);
   assert.ok(personA.records.every(({ personId }) => personId === 'test-a'));
   assert.ok(personA.monthlyValues.every(({ personId }) => personId === 'test-a'));
-  assert.deepEqual(personA.categories.map(({ label }) => label), ['Mercado']);
+  assert.deepEqual(personA.categories.map(({ label }) => label), ['Sem categoria']);
   const personB = buildState(db, config, MONTH, 'test-b');
   assert.equal(personB.summary.salary, null);
   assert.equal(personB.summary.card, 0);
@@ -153,7 +153,7 @@ test('estado mantém snapshot consistente durante escrita concorrente do bot', (
   assert.equal(reader.isTransaction, false);
   const current = buildState(reader, config, MONTH);
   assert.equal(current.summary.expenses, 15_000);
-  assert.equal(current.summary.salary, 350_000);
+  assert.equal(current.summary.salary, 650_000);
   assert.equal(current.goals.spendingCap, 60_000);
   assert.equal(current.goals.investmentGoal, 30_000);
 });
@@ -173,26 +173,26 @@ test('snapshot de estado encerra falhas e preserva transação externa', (t) => 
   assert.equal(buildState(db, config, MONTH).summary.salary, null);
 });
 
-test('API cadastra, atualiza e remove valores mensais sem duplicar nem alterar lançamentos', async (t) => {
-  const { db, send } = await fixture(t);
-  const body = { personId: 'test-a', month: MONTH, kind: 'salary', cents: 300_000 };
-  assert.deepEqual((await send('/api/monthly-values', { method: 'POST', body })).body, { saved: true, created: true });
-  assert.deepEqual((await send('/api/monthly-values', { method: 'POST', body: { ...body, cents: 350_000 } })).body,
-    { saved: true, created: false });
-  assert.equal((await send('/api/monthly-values', { method: 'POST', body: { ...body, kind: 'card', cents: 0 } })).status, 200);
-  assert.equal((await send('/api/monthly-values', { method: 'POST', body: { ...body, personId: 'test-b', cents: 0 } })).status, 200);
-  assert.equal((await send('/api/monthly-values', { method: 'POST', body: { ...body, month: '2026-09', cents: 150_000 } })).status, 200);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM monthly_values').get().n, 4);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM expenses').get().n, 0);
-  const state = (await send(`/api/state?month=${MONTH}&scope=test-a`)).body;
-  assert.equal(state.summary.salary, 350_000);
-  assert.equal(state.summary.card, 0);
-  assert.equal(state.summary.estimatedBalance, 350_000);
-  assert.equal((await send('/api/monthly-values/remove', { method: 'POST', body })).status, 200);
-  assert.equal((await send('/api/monthly-values/remove', { method: 'POST', body })).status, 404);
-  assert.equal(buildState(db, config, MONTH, 'test-a').summary.salary, null);
-  assert.equal(buildState(db, config, MONTH, 'test-b').summary.salary, 0);
-  assert.equal(buildState(db, config, '2026-09', 'test-a').summary.salary, 150_000);
+test('API adiciona, edita e exclui itens mensais pelo ID, com isolamento e saldo sem fatura', async (t) => {
+ const {db,send}=await fixture(t);
+ const body={personId:'test-a',month:MONTH,kind:'salary',cents:200000,description:'Empresa'};
+ const first=(await send('/api/monthly-values',{method:'POST',body})).body;
+ const second=(await send('/api/monthly-values',{method:'POST',body:{...body,cents:80000}})).body;
+ assert.equal(first.created,true);assert.notEqual(first.id,second.id);
+ assert.equal(buildState(db,config,MONTH).summary.salary,280000);
+ await send('/api/monthly-values',{method:'POST',body:{...body,kind:'card',cents:50000}});
+ await send('/api/monthly-values',{method:'POST',body:{...body,kind:'card',cents:30000}});
+ let state=buildState(db,config,MONTH);assert.equal(state.summary.card,80000);assert.equal(state.summary.estimatedBalance,280000);
+ const update=await send('/api/monthly-values',{method:'POST',body:{...body,id:first.id,cents:100000,date:'2026-10-02'}});
+ assert.equal(update.body.created,false);assert.equal(buildState(db,config,MONTH).summary.salary,180000);
+ assert.equal((await send('/api/monthly-values/remove',{method:'POST',body:{id:second.id}})).status,200);
+ assert.equal((await send('/api/monthly-values/remove',{method:'POST',body:{id:second.id}})).status,404);
+ assert.equal((await send('/api/monthly-values/remove',{method:'POST',body})).status,400);
+ assert.equal(buildState(db,config,MONTH).summary.salary,100000);
+ const foreign=setMonthlyValue(db,{groupId:'other@g.us',actorId:'test-a',month:MONTH,kind:'salary',amountCents:1});
+ assert.equal((await send('/api/monthly-values',{method:'POST',body:{...body,id:foreign.id}})).status,404);
+ assert.equal((await send('/api/monthly-values/remove',{method:'POST',body:{id:foreign.id}})).status,404);
+ assert.equal(db.prepare('SELECT COUNT(*) AS n FROM expenses').get().n,0);
 });
 
 test('metas e correção de reserva antiga preservam valor, data e identidade da mensagem', async (t) => {
@@ -385,4 +385,67 @@ test('somente assets públicos explícitos são acessíveis, incluindo Motion lo
   for (const path of ['/config.json', '/dados/gastos.sqlite', '/sessao/creds.json', '/assets/../config.json', '/public/assets/motion.js', '/assets/unknown.js']) {
     assert.equal((await send(path)).status, 404, path);
   }
+});
+
+test('semanas de segunda a domingo atravessam meses e anos sem misturar pessoas, aportes ou faturas', (t) => {
+ const db=openDb(':memory:');t.after(()=>db.close());
+ assert.deepEqual(weekFor('2026-10-01'),{start:'2026-09-28',end:'2026-10-04'});
+ assert.deepEqual(weekFor('2027-01-01'),{start:'2026-12-28',end:'2027-01-03'});
+ record(db,{date:'2026-09-27',cents:999});
+ record(db,{date:'2026-09-28',cents:10000});record(db,{date:'2026-10-04',cents:30000,personId:'test-b'});
+ record(db,{date:'2026-10-05',cents:999});record(db,{date:'2026-09-29',kind:'investment',cents:50000});
+ record(db,{date:'2026-09-30',cents:999,groupId:'other@g.us'});
+ monthly(db,'test-a','card',90000);monthly(db,'test-a','salary',200000);monthly(db,'test-a','salary',80000);
+ const all=buildState(db,config,MONTH,'all','2026-10-01');
+ assert.equal(all.weekly.summary.expenses,40000);assert.equal(all.weekly.summary.investments,50000);
+ assert.equal(all.weekly.days[0].expenses,10000);assert.equal(all.weekly.days[6].expenses,30000);
+ assert.equal(all.summary.salary,280000);assert.equal(all.summary.salaryInformedCount,1);assert.equal(all.summary.balancePartial,true);
+ assert.equal(all.weekly.undatedMonthlyCount,3);
+ assert.equal(all.summary.expenses,30999);assert.equal(all.summary.estimatedBalance,249001);
+ assert.equal(buildState(db,config,MONTH,'test-a','2026-10-04').weekly.summary.expenses,10000);
+ assert.equal(buildState(db,config,MONTH,'test-b','2026-10-04').weekly.summary.expenses,30000);
+ assert.equal(all.weekly.comparison.previous,999);
+ assert.equal(all.comparison.previous,10999);
+ assert.equal(buildState(db,config,'1900-01').summary.expenses,0);
+});
+
+test('categorias editáveis compõem apenas gastos; percentuais e comparações vazias são válidos', async (t) => {
+ const {db,send}=await fixture(t);
+ const a=record(db,{cents:10000});const b=record(db,{cents:30000,personId:'test-b'});
+ db.prepare("UPDATE expenses SET category='Alimentação' WHERE id=?").run(a);
+ record(db,{cents:80000,kind:'investment'});
+ const state=buildState(db,config,MONTH);
+ assert.deepEqual(state.categories.map(c=>[c.label,c.cents,c.percent]),[['Sem categoria',30000,75],['Alimentação',10000,25]]);
+ assert.equal(state.categories.reduce((sum,c)=>sum+c.percent,0),100);
+ assert.deepEqual(buildState(db,config,'2028-02').categories,[]);
+ assert.equal(buildState(db,config,'2028-02').days.length,29);
+ assert.deepEqual(comparison(100,0,true),{previous:0,delta:100,percent:null});
+ assert.deepEqual(comparison(0,0,false),{previous:null,delta:null,percent:null});
+ const payload={id:b,personId:'test-b',cents:30000,description:'Outro gasto',kind:'expense',date:'2026-10-05',category:'Lazer'};
+ assert.equal((await send('/api/records',{method:'POST',body:payload})).status,200);
+ assert.equal(buildState(db,config,MONTH,'test-b').categories[0].label,'Lazer');
+ for(const category of [12,'x'.repeat(61),'bad\ncategory','   '])assert.equal((await send('/api/records',{method:'POST',body:{...payload,category}})).status,400);
+ for(const value of [{date:'2026-09-30'},{date:'2026-02-30'},{date:0},{description:12},{description:'bad\nvalue'},{id:'1'}]) {
+   assert.equal((await send('/api/monthly-values',{method:'POST',body:{month:MONTH,personId:'test-a',kind:'salary',cents:100,...value}})).status,400);
+ }
+ for(const week of ['2026-02-30','2026-10-1','1899-12-31','2199-12-31'])assert.equal((await send('/api/state?week='+week)).status,400);
+});
+
+test('edição e exclusão na API não permitem replay da mensagem original do WhatsApp', async (t) => {
+ const {db,send}=await fixture(t);
+ const event={groupId:config.groupId,messageId:'whatsapp-original',person:config.people[0],text:'salario Empresa 2000',instant:new Date('2026-10-02T01:00:00Z')};
+ processText(db,event);
+ const original=db.prepare('SELECT * FROM monthly_values').get();
+ assert.equal(original.entry_date,'2026-10-01');
+ const body={id:original.id,month:MONTH,personId:'test-b',kind:'salary',cents:210000,description:'Origem corrigida',date:null};
+ assert.equal((await send('/api/monthly-values',{method:'POST',body})).status,200);
+ let row=db.prepare('SELECT * FROM monthly_values').get();
+ assert.equal(row.message_id,original.message_id);assert.equal(row.id,original.id);
+ assert.equal(processText(db,event),null);
+ assert.equal((await send('/api/monthly-values/remove',{method:'POST',body:{id:original.id}})).status,200);
+ assert.equal(processText(db,event),null);
+ assert.equal(buildState(db,config,MONTH).summary.salary,null);
+ assert.equal(db.prepare('SELECT COUNT(*) AS n FROM monthly_values').get().n,1);
+ processText(db,{...event,messageId:'whatsapp-another'});
+ assert.equal(buildState(db,config,MONTH).summary.salary,200000);
 });

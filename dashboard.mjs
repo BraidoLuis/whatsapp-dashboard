@@ -80,12 +80,37 @@ function goalFor(db, group, month, scope) {
     || { spendingCap: null, investmentGoal: null };
 }
 
-export function buildState(db, config, month, scope = 'all') {
+export function shiftDate(date, days) {
+  const value = new Date(`${checkDate(date)}T12:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0,10);
+}
+export function weekFor(date) {
+  checkDate(date);
+  if (date < '1900-01-08' || date > '2199-12-24') throw fail(400, 'Escolha uma semana entre 08/01/1900 e 24/12/2199.');
+  const start = shiftDate(date, -((new Date(`${date}T12:00:00Z`).getUTCDay() + 6) % 7));
+  return { start, end: shiftDate(start, 6) };
+}
+export function comparison(current, previous, hasPrevious) {
+  return { previous: hasPrevious ? previous : null, delta: hasPrevious ? current - previous : null,
+    percent: hasPrevious && previous > 0 ? (current - previous) / previous * 100 : null };
+}
+export function buildState(db, config, month, scope = 'all', weekDate = dateFor(new Date())) {
   // O bot usa outra conexão: todos os SELECTs devem enxergar o mesmo instante.
   // SAVEPOINT também preserva uma eventual transação aberta pelo chamador.
   db.exec('SAVEPOINT dashboard_state_read');
   try {
     const state = readStateSnapshot(db, config, month, scope);
+    const previousMonth = shiftDate(`${month}-01`, -1).slice(0,7);
+    const prior = month === '1900-01' ? { summary: { expenses: 0 }, records: [] } : readStateSnapshot(db, config, previousMonth, scope);
+    state.comparison = comparison(state.summary.expenses, prior.summary.expenses, prior.records.some(r => r.kind === 'expense'));
+    const week = weekFor(weekDate);
+    state.weekly = readStateSnapshot(db, config, month, scope, week);
+    const previousWeek = { start: shiftDate(week.start,-7), end: shiftDate(week.end,-7) };
+    const priorWeek = readStateSnapshot(db, config, month, scope, previousWeek);
+    state.weekly.comparison = comparison(state.weekly.summary.expenses, priorWeek.summary.expenses, priorWeek.records.some(r => r.kind === 'expense'));
+    state.weekly.period = week;
+    state.weekly.undatedMonthlyCount = state.monthlyValues.filter(v => !v.date).length;
     db.exec('RELEASE dashboard_state_read');
     return state;
   } catch (error) {
@@ -94,14 +119,14 @@ export function buildState(db, config, month, scope = 'all') {
   }
 }
 
-function readStateSnapshot(db, config, month, scope) {
+function readStateSnapshot(db, config, month, scope, period = null) {
   checkConfig(config); checkMonth(month); checkScope(scope, config);
-  const params = [config.groupId, month];
+  const params = period ? [config.groupId, period.start, period.end] : [config.groupId, month];
   const personFilter = scope === 'all' ? '' : ' AND actor_id = ?';
   if (scope !== 'all') params.push(scope);
   const records = db.prepare(`SELECT id, actor_id AS personId, actor_name AS personName, description,
-    amount_cents AS cents, kind, spent_date AS date, message_id AS messageId FROM expenses
-    WHERE group_id = ? AND substr(spent_date, 1, 7) = ? AND deleted_at IS NULL ${personFilter}
+    amount_cents AS cents, kind, spent_date AS date, message_id AS messageId, COALESCE(category, 'Sem categoria') AS category FROM expenses
+    WHERE group_id = ? AND ${period ? 'spent_date BETWEEN ? AND ?' : 'substr(spent_date, 1, 7) = ?'} AND deleted_at IS NULL ${personFilter}
     ORDER BY spent_date DESC, id DESC`).all(...params);
   if (records.length > 20_000) throw fail(413, 'Há muitos lançamentos neste mês para esta versão local.');
   const nameMap = new Map(config.people.map((p) => [p.id, p.name]));
@@ -109,16 +134,16 @@ function readStateSnapshot(db, config, month, scope) {
   const people = new Map(selectedPeople.map((p) => [p.id, {
     id: p.id, name: p.name, expenses: 0, investments: 0, salary: null, card: null, estimatedBalance: null,
   }]));
-  const monthlyValues = db.prepare(`SELECT actor_id AS personId, kind, amount_cents AS cents, month,
-    updated_at AS updatedAt FROM monthly_values WHERE group_id = ? AND month = ?
+  const monthlyValues = period ? [] : db.prepare(`SELECT id, actor_id AS personId, kind, amount_cents AS cents, month,
+    updated_at AS updatedAt, description, entry_date AS date, migrated FROM monthly_values WHERE group_id = ? AND month = ? AND deleted_at IS NULL
     AND actor_id IN (${selectedPeople.map(() => '?').join(',')}) ORDER BY actor_id, kind`)
     .all(config.groupId, month, ...selectedPeople.map((p) => p.id));
   for (const value of monthlyValues) {
     value.personName = nameMap.get(value.personId);
-    people.get(value.personId)[value.kind] = value.cents;
+    people.get(value.personId)[value.kind] = (people.get(value.personId)[value.kind] ?? 0) + value.cents;
   }
-  const daysCount = new Date(Number(month.slice(0, 4)), Number(month.slice(5)), 0).getDate();
-  const days = Array.from({ length: daysCount }, (_, index) => ({ day: index + 1, expenses: 0, investments: 0 }));
+  const daysCount = period ? 7 : new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5)), 0)).getUTCDate();
+  const days = Array.from({ length: daysCount }, (_, index) => ({ day: index + 1, date: period ? shiftDate(period.start,index) : `${month}-${String(index+1).padStart(2,'0')}`, expenses: 0, investments: 0 }));
   const descriptions = new Map();
   let expenses = 0; let investments = 0;
   for (const record of records) {
@@ -128,14 +153,14 @@ function readStateSnapshot(db, config, month, scope) {
       id: record.personId, name: record.personName, expenses: 0, investments: 0, salary: null, card: null, estimatedBalance: null,
     });
     people.get(record.personId)[field] += record.cents;
-    const day = days[Number(record.date.slice(8)) - 1];
+    const day = days.find(day => day.date === record.date);
     if (!day) throw fail(422, 'Há um lançamento com data inválida neste mês.');
     day[field] += record.cents;
     if (record.kind === 'investment') investments += record.cents;
     else {
       expenses += record.cents;
-      const key = record.description.toLocaleLowerCase('pt-BR');
-      const prior = descriptions.get(key) || { label: record.description, cents: 0 };
+      const key = record.category.toLocaleLowerCase('pt-BR');
+      const prior = descriptions.get(key) || { label: record.category, cents: 0 };
       prior.cents += record.cents;
       descriptions.set(key, prior);
     }
@@ -153,15 +178,17 @@ function readStateSnapshot(db, config, month, scope) {
     throw fail(422, 'Os totais ultrapassam o limite de precisão.');
   }
   const goals = goalFor(db, config.groupId, month, scope);
-  const categories = [...descriptions.values()].sort((a, b) => b.cents - a.cents);
+  const categories = [...descriptions.values()].sort((a, b) => b.cents - a.cents).map(c => ({ ...c, percent: expenses ? c.cents / expenses * 100 : 0 }));
+  const salaryCount = new Set(salaries.map(v => v.personId)).size;
+  const cardCount = new Set(cards.map(v => v.personId)).size;
   return {
     groupName: config.groupName || 'Gastos do casal', month, scope,
     participants: config.people.map(({ id, name }) => ({ id, name })),
     summary: {
       expenses, investments, count: records.length,
       remaining: goals.spendingCap === null ? null : goals.spendingCap - expenses,
-      salary, card, estimatedBalance, salaryInformedCount: salaries.length, cardInformedCount: cards.length,
-      participantCount: selectedPeople.length, balancePartial: salaries.length > 0 && salaries.length < selectedPeople.length,
+      salary, card, estimatedBalance, salaryInformedCount: salaryCount, cardInformedCount: cardCount,
+      participantCount: selectedPeople.length, balancePartial: salaryCount > 0 && salaryCount < selectedPeople.length,
     },
     goals, days, categories, people: [...people.values()], records, monthlyValues,
     updatedAt: new Date().toISOString(), today: dateFor(new Date()),
@@ -226,7 +253,7 @@ export function createDashboard({ db, getConfig, html, publicRoot = ROOT, token 
       }
       if (request.method === 'GET' && url.pathname === '/api/state') {
         const month = url.searchParams.get('month') || dateFor(new Date()).slice(0, 7);
-        json(200, buildState(db, config, month, url.searchParams.get('scope') || 'all'));
+        json(200, buildState(db, config, month, url.searchParams.get('scope') || 'all', url.searchParams.get('week') || dateFor(new Date())));
         return;
       }
       if (request.method !== 'POST') throw fail(404, 'Página não encontrada.');
@@ -237,23 +264,34 @@ export function createDashboard({ db, getConfig, html, publicRoot = ROOT, token 
         || request.headers.origin !== expectedOrigin) throw fail(403, 'Reabra a dashboard para continuar.');
       const body = await readJson(request);
       if (url.pathname === '/api/monthly-values' || url.pathname === '/api/monthly-values/remove') {
+        if (body.id !== undefined && (!Number.isSafeInteger(body.id) || body.id < 1)) throw fail(400, 'Lançamento inválido.');
+        if (url.pathname.endsWith('/remove')) {
+          if (!body.id) throw fail(400, 'Escolha o lançamento a remover.');
+          const changed = db.prepare('UPDATE monthly_values SET deleted_at = ? WHERE id = ? AND group_id = ? AND deleted_at IS NULL')
+            .run(new Date().toISOString(),body.id,config.groupId);
+          if (!changed.changes) throw fail(404,'Lançamento não encontrado.');
+          json(200,{ removed:true }); return;
+        }
         const month = checkMonth(body.month);
         const person = config.people.find((p) => p.id === body.personId);
         if (!person) throw fail(400, 'Pessoa inválida.');
         if (!['salary', 'card'].includes(body.kind)) throw fail(400, 'Tipo inválido.');
-        if (url.pathname.endsWith('/remove')) {
-          const changed = db.prepare(`DELETE FROM monthly_values
-            WHERE group_id = ? AND month = ? AND actor_id = ? AND kind = ?`)
-            .run(config.groupId, month, person.id, body.kind);
-          if (!changed.changes) throw fail(404, 'Valor mensal não encontrado.');
-          json(200, { removed: true }); return;
-        }
         const cents = checkCents(body.cents, false, true);
+        const description = body.description == null || body.description === '' ? null : body.description;
+        if (description !== null && (typeof description !== 'string' || description.length > 120 || /[\r\n]/u.test(description))) throw fail(400,'Descrição inválida.');
+        const date = body.date === undefined || body.date === null || body.date === '' ? null : checkDate(body.date);
+        if (date && date.slice(0,7) !== month) throw fail(400,'A data deve pertencer ao mês selecionado.');
+        if (body.id) {
+          const changed = db.prepare(`UPDATE monthly_values SET month=?,actor_id=?,kind=?,amount_cents=?,description=?,entry_date=?,updated_at=?
+            WHERE id=? AND group_id=? AND deleted_at IS NULL`).run(month,person.id,body.kind,cents,description,date,new Date().toISOString(),body.id,config.groupId);
+          if (!changed.changes) throw fail(404,'Lançamento não encontrado.');
+          json(200,{ saved:true,created:false,id:body.id }); return;
+        }
         const result = setMonthlyValue(db, {
           groupId: config.groupId, month, actorId: person.id, kind: body.kind,
-          amountCents: cents, updatedAt: new Date().toISOString(),
+          amountCents: cents, updatedAt: new Date().toISOString(), description, date,
         });
-        json(200, { saved: true, created: result.created }); return;
+        json(200, { saved: true, ...result }); return;
       }
       if (url.pathname === '/api/goals') {
         const month = checkMonth(body.month);
@@ -275,18 +313,20 @@ export function createDashboard({ db, getConfig, html, publicRoot = ROOT, token 
         if (!['expense', 'investment'].includes(body.kind)) throw fail(400, 'Tipo inválido.');
         const cents = checkCents(body.cents);
         const date = checkDate(body.date);
+        const category = body.category == null || body.category === '' ? null : body.category;
+        if (category !== null && (typeof category !== 'string' || !category.trim() || category.length > 60 || /[\r\n]/u.test(category))) throw fail(400,'Categoria inválida.');
         let id;
         if (body.id !== null && body.id !== undefined) {
           if (!Number.isSafeInteger(body.id) || body.id < 1) throw fail(400, 'Lançamento inválido.');
-          const changed = db.prepare(`UPDATE expenses SET actor_id = ?, actor_name = ?, description = ?, amount_cents = ?, kind = ?, spent_date = ?
-            WHERE id = ? AND group_id = ? AND deleted_at IS NULL`).run(person.id, person.name, description, cents, body.kind, date, body.id, config.groupId);
+          const changed = db.prepare(`UPDATE expenses SET actor_id = ?, actor_name = ?, description = ?, amount_cents = ?, kind = ?, spent_date = ?, category = ?
+            WHERE id = ? AND group_id = ? AND deleted_at IS NULL`).run(person.id, person.name, description, cents, body.kind, date, category?.trim() || null, body.id, config.groupId);
           if (!changed.changes) throw fail(404, 'Lançamento não encontrado.');
           id = body.id;
         } else {
           const inserted = db.prepare(`INSERT INTO expenses
-            (group_id, message_id, actor_id, actor_name, description, amount_cents, kind, spent_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(config.groupId, `dashboard-${randomUUID()}`, person.id, person.name,
-            description, cents, body.kind, date, new Date().toISOString());
+            (group_id, message_id, actor_id, actor_name, description, amount_cents, kind, spent_date, created_at, category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(config.groupId, `dashboard-${randomUUID()}`, person.id, person.name,
+            description, cents, body.kind, date, new Date().toISOString(), category?.trim() || null);
           id = Number(inserted.lastInsertRowid);
         }
         json(200, { saved: true, id }); return;

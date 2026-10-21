@@ -60,9 +60,13 @@ function parseMoney(input, { optional = false, zero = true } = {}) {
   return cents;
 }
 
+let screen = 'summary';
+let weekCategory = '';
 let state = null;
 let requestId = 0;
 let controller;
+let pendingLoad = null;
+let pendingLoadKey = '';
 let visibleRecords = 20;
 let showAllDescriptions = false;
 let editingRecord = null;
@@ -99,7 +103,7 @@ import('/assets/motion.js').then((module) => {
   if (typeof module.animate !== 'function') throw new Error('Motion indisponível');
   motionAnimate = module.animate;
   document.documentElement.dataset.motion = reducedMotion.matches ? 'reduced' : 'ready';
-  if (state && !$('data-region').hidden) document.querySelectorAll('.animate-card').forEach((card, index) => entrance(card, Math.min(index * 0.015, 0.1)));
+  if (state && !$('data-region').hidden) document.querySelectorAll('.animate-card:not([hidden])').forEach((card, index) => entrance(card, Math.min(index * 0.015, 0.1)));
 }).catch(() => { document.documentElement.dataset.motion = reducedMotion.matches ? 'reduced' : 'fallback'; });
 reducedMotion.addEventListener('change', () => {
   stopAnimations();
@@ -128,7 +132,19 @@ function setLoading(loading) {
   $('refresh').disabled = loading;
   $('retry').disabled = loading;
 }
-async function loadState() {
+function loadState() {
+  const key = [$('month').value, $('scope').value, $('week-date').value].join('|');
+  // Date inputs can emit repeated change events. Share the same in-flight read
+  // instead of aborting it and opening another connection for identical filters.
+  if (pendingLoad && pendingLoadKey === key) return pendingLoad;
+  pendingLoadKey = key;
+  const pending = loadStateRequest();
+  pendingLoad = pending;
+  const clear = () => { if (pendingLoad === pending) pendingLoad = null; };
+  pending.then(clear, clear);
+  return pending;
+}
+async function loadStateRequest() {
   const month = $('month').value; const scope = $('scope').value;
   if (!/^(?:19|20|21)\d{2}-(?:0[1-9]|1[0-2])$/u.test(month)) {
     ++requestId; controller?.abort(); backgroundRequest = null; stopAnimations(); state = null;
@@ -153,14 +169,14 @@ async function loadState() {
   setLoading(true);
   updateMonthButtons();
   try {
-    const fresh = await api(`/api/state?${new URLSearchParams({ month, scope })}`, undefined, controller.signal);
+    const fresh = await api(`/api/state?${new URLSearchParams({ month, scope, week: $('week-date').value })}`, undefined, controller.signal);
     if (current !== requestId) return false;
     if (fresh.month !== month || fresh.scope !== scope) throw new Error('Os dados recebidos não correspondem aos filtros selecionados. Atualize novamente.');
     state = fresh;
     $('data-region').hidden = false;
     render();
     document.documentElement.dataset.state = 'ready';
-    document.querySelectorAll('.animate-card').forEach((card, index) => entrance(card, Math.min(index * 0.015, 0.1)));
+    document.querySelectorAll('.animate-card:not([hidden])').forEach((card, index) => entrance(card, Math.min(index * 0.015, 0.1)));
     return true;
   } catch (error) {
     if (error.name === 'AbortError' || current !== requestId) return false;
@@ -178,8 +194,9 @@ function canRefreshQuietly() {
     && !document.querySelector('dialog[open]') && !document.querySelector('form[data-busy="true"]');
 }
 function snapshotKey(snapshot) {
-  const { updatedAt, ...values } = snapshot;
-  return JSON.stringify(values);
+  const { updatedAt, weekly, ...values } = snapshot;
+  const { updatedAt: weeklyUpdatedAt, ...weeklyValues } = weekly;
+  return JSON.stringify({ ...values, weekly: weeklyValues });
 }
 async function refreshQuietly() {
   if (!canRefreshQuietly() || backgroundRequest) return;
@@ -190,7 +207,7 @@ async function refreshQuietly() {
   backgroundRequest = current;
   document.documentElement.dataset.backgroundRefresh = 'pending';
   try {
-    const fresh = await api(`/api/state?${new URLSearchParams({ month, scope })}`, undefined, controller.signal);
+    const fresh = await api(`/api/state?${new URLSearchParams({ month, scope, week: $('week-date').value })}`, undefined, controller.signal);
     if (current !== requestId || !canRefreshQuietly() || $('month').value !== month || $('scope').value !== scope) return;
     if (fresh.month !== month || fresh.scope !== scope) throw new Error('Os dados recebidos não correspondem aos filtros selecionados. Atualize novamente.');
     const changed = snapshotKey(state) !== snapshotKey(fresh);
@@ -260,7 +277,14 @@ function render() {
   setText('record-count', `${summary.count} ${summary.count === 1 ? 'lançamento' : 'lançamentos'}`);
   updateTimestamp();
   setText('footer-scope', `${selectedName()} · ${monthLabel(state.month)}`);
-  renderChart(); renderBreakdown(); renderPeople(); renderMonthly(); renderRecords();
+  renderChart(); renderBreakdown(); renderPeople(); renderMonthly(); renderRecords(); renderWeekly(); applyScreen();
+  setText('month-comparison', comparisonText(state.comparison, 'mês anterior'));
+  const options = $('category-filter'); const category = options.value;
+  options.replaceChildren(new Option('Todas as categorias',''));
+  const suggestions = $('category-options'); suggestions.replaceChildren();
+  for (const item of state.categories) { options.add(new Option(item.label,item.label)); suggestions.append(new Option(item.label,item.label)); }
+  options.value = [...options.options].some(o => o.value === category) ? category : '';
+  renderRecords();
 }
 function updateTimestamp() {
   setText('updated', `Atualizado às ${new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }).format(new Date(state.updatedAt))}`);
@@ -330,19 +354,73 @@ function renderChart() {
   });
   container.append(svg);
 }
+function comparisonText(value, label) {
+  if (value.previous === null) return 'Sem gastos registrados no período anterior (' + label + ') para comparar.';
+  if (value.previous === 0) return 'Período anterior com total zero; comparação percentual indisponível.';
+  return (value.percent > 0 ? '+' : '') + value.percent.toFixed(1).replace('.',',') + '% sobre o período anterior (' + label + ') · ' + currency(value.previous) + ' antes';
+}
+const colors = ['var(--accent)','var(--green)','var(--orange)','var(--blue)','var(--red)','#827127'];
+function composition(data, total, chartId, listId, onSelect) {
+  const chart = $(chartId); const list = $(listId); chart.replaceChildren(); list.replaceChildren();
+  if (!total || !data.length) { list.append(empty('Sem gastos para distribuir','Registre gastos para acompanhar as categorias.','chart')); return; }
+  const svg = svgNode('svg',{viewBox:'0 0 160 160',role:'img','aria-label':'Participação das categorias. Valores e percentuais na legenda a seguir.'});
+  let offset = 0;
+  data.forEach((item,index) => {
+    const percent = item.cents / total * 100;
+    const circle = svgNode('circle',{cx:80,cy:80,r:57,fill:'none',stroke:colors[index%colors.length],'stroke-width':24,pathLength:100,'stroke-dasharray':percent+' '+(100-percent),'stroke-dashoffset':-offset,transform:'rotate(-90 80 80)'});
+    circle.append(svgNode('title',{},item.label+': '+currency(item.cents)+' · '+percent.toFixed(1)+'%')); svg.append(circle); offset += percent;
+    const row = el('button','category-row break-row'); row.type='button'; row.style.setProperty('--category-color',colors[index%colors.length]);
+    const selected = chartId === 'week-donut' ? weekCategory === item.label : $('category-filter').value === item.label;
+    row.setAttribute('aria-pressed',String(selected));
+    row.append(el('span','category-swatch'),el('span','',item.label),el('strong','',currency(item.cents)),el('span','',percent.toFixed(1).replace('.',',')+'%'));
+    row.addEventListener('click',() => onSelect(selected ? '' : item.label)); list.append(row);
+  });
+  svg.append(svgNode('text',{x:80,y:78,'text-anchor':'middle',class:'donut-label'},'Gastos'),svgNode('text',{x:80,y:98,'text-anchor':'middle',class:'donut-total'},currency(total)));
+  chart.append(svg); entrance(chart);
+}
 function renderBreakdown() {
-  const container = $('breakdown'); container.replaceChildren();
-  const categories = showAllDescriptions ? state.categories : state.categories.slice(0, 5);
-  $('more-descriptions').hidden = state.categories.length <= 5;
-  setText('more-descriptions', showAllDescriptions ? 'Mostrar menos descrições' : `Ver todas as ${state.categories.length} descrições`);
-  if (!categories.length) { container.append(empty('Sem gastos para distribuir', 'As descrições dos seus gastos serão agrupadas aqui.', 'chart')); return; }
-  for (const category of categories) {
-    const ratio = category.cents / state.summary.expenses;
-    const row = el('div', 'break-row'); const label = el('div', 'break-label');
-    const value = el('strong', '', currency(category.cents)); value.append(el('small', '', `${Math.round(ratio * 100)}%`));
-    label.append(el('span', '', category.label), value);
-    const bar = el('div', 'bar'); const fill = el('div', 'bar-fill'); bar.append(fill); row.append(label, bar); container.append(row); setBar(fill, ratio);
+  $('more-descriptions').hidden = true;
+  setText('category-base', monthLabel(state.month)+' · '+selectedName()+' · base: '+currency(state.summary.expenses)+' em gastos (100%)');
+  composition(state.categories,state.summary.expenses,'monthly-donut','breakdown',label => {
+    $('category-filter').value=label; visibleRecords=20; renderBreakdown(); renderRecords();
+    toast(label ? 'Categoria selecionada. Veja os itens em Lançamentos.' : 'Todas as categorias.');
+  });
+}
+function renderWeekly() {
+  const week = state.weekly;
+  setText('week-range',dateLabel(week.period.start)+' a '+dateLabel(week.period.end)+' · '+selectedName());
+  setText('week-total',currency(week.summary.expenses));
+  setText('week-comparison',comparisonText(week.comparison,'semana anterior'));
+  setText('week-undated',week.undatedMonthlyCount ? week.undatedMonthlyCount+' recebimentos/faturas sem data no mês selecionado; sem atribuição semanal.' : 'Datas do WhatsApp seguem America/Sao_Paulo.');
+  if (!week.categories.some(c => c.label === weekCategory)) weekCategory='';
+  $('previous-week').disabled=week.period.start <= '1900-01-08'; $('next-week').disabled=week.period.end >= '2199-12-26';
+  setText('week-base',dateLabel(week.period.start)+' a '+dateLabel(week.period.end)+' · base: '+currency(week.summary.expenses)+' em gastos (100%)');
+  composition(week.categories,week.summary.expenses,'week-donut','week-categories',label => { weekCategory=label; renderWeekly(); });
+  const days=$('week-days'); days.replaceChildren();
+  const max=Math.max(1,...week.days.map(d=>d.expenses));
+  for (const day of week.days) {
+    const row=el('div','daily-row'); const bar=el('div','bar'); const fill=el('div','bar-fill');bar.append(fill);
+    row.append(el('span','',new Intl.DateTimeFormat('pt-BR',{weekday:'short',timeZone:'UTC'}).format(new Date(day.date+'T12:00:00Z'))+' '+dateLabel(day.date).slice(0,5)),bar,el('strong','',currency(day.expenses)));days.append(row);setBar(fill,day.expenses/max);
   }
+  const records=$('week-records'); records.replaceChildren();
+  $('clear-week-category').hidden=!weekCategory;
+  for (const record of week.records.filter(r=>r.kind==='expense' && (!weekCategory || r.category===weekCategory))) {
+    const row=el('div','week-record');row.append(el('span','',record.description+' · '+record.category+' · '+record.personName+' · '+dateLabel(record.date)),el('strong','',currency(record.cents))); records.append(row);
+  }
+  if (!records.children.length) records.append(empty('Nenhum gasto nesta semana','Escolha outra semana ou registre um gasto.'));
+}
+function applyScreen() {
+  for (const node of document.querySelectorAll('[data-views]')) node.hidden=!node.dataset.views.split(' ').includes(screen);
+  for (const link of document.querySelectorAll('[data-screen]')) { if(link.dataset.screen===screen) link.setAttribute('aria-current','page'); else link.removeAttribute('aria-current'); }
+  const labels={summary:'Resumo',weekly:'Semanal',analysis:'Mensal',history:'Lançamentos',planning:'Planejamento'};
+  document.querySelector('.breadcrumb b').textContent=labels[screen];
+  setText('page-title',screen==='summary' ? 'Seu mês, com clareza.' : labels[screen]);
+  document.querySelector('.period-filter').hidden=screen==='weekly';
+  if(screen==='analysis' && state) renderChart();
+}
+function switchScreen(value) {
+  screen=['summary','weekly','analysis','history','planning'].includes(value) ? value : 'summary';
+  applyScreen(); document.querySelectorAll('[data-views]:not([hidden])').forEach(node=>entrance(node));
 }
 function initials(name) { return name.trim().split(/\s+/u).map((part) => part[0]).slice(0, 2).join('').toLocaleUpperCase('pt-BR'); }
 function renderPeople() {
@@ -365,25 +443,25 @@ function actionButton(iconName, label, data) {
   return button;
 }
 function renderMonthly() {
-  const container = $('monthly-values'); container.replaceChildren();
-  for (const person of state.people) {
-    // Older actors may appear in history; monthly edits are restricted to the configured participants.
-    if (!state.participants.some((participant) => participant.id === person.id)) continue;
-    const node = el('div', 'monthly-person'); node.dataset.personId = person.id; node.append(el('strong', '', person.name));
-    for (const [kind, label] of [['salary', 'Salário'], ['card', 'Fatura do cartão']]) {
-      const row = el('div', 'monthly-row'); row.dataset.monthlyKind = kind;
-      const amount = el('strong', person[kind] === null ? 'missing' : '', currency(person[kind]));
-      if (person[kind] === null) amount.setAttribute('aria-label', 'Não informado');
-      row.append(el('span', '', label), amount, actionButton('edit', `${person[kind] === null ? 'Informar' : 'Editar'} ${kind === 'salary' ? 'salário' : 'fatura'} de ${person.name}`, { monthlyKind: kind, personId: person.id }));
-      container.append(node); node.append(row);
+  const container=$('monthly-values'); container.replaceChildren();
+  for(const person of state.people.filter(p=>state.participants.some(x=>x.id===p.id))) {
+    const node=el('section','monthly-person'); node.dataset.personId=person.id; node.append(el('strong','',person.name));
+    for(const [kind,label] of [['salary','Recebimentos'],['card','Faturas · informativas']]) {
+      const row=el('div','monthly-row');row.append(el('span','',label),el('strong','',currency(person[kind])),actionButton('plus','Adicionar '+label+' de '+person.name,{monthlyKind:kind,personId:person.id})); node.append(row);
+      for(const value of state.monthlyValues.filter(v=>v.personId===person.id && v.kind===kind)) {
+        const entry=el('div','monthly-entry');entry.dataset.monthlyId=value.id;
+        const text=el('div'); text.append(el('strong','',value.description || (kind==='salary'?'Recebimento':'Fatura')),el('small','',value.date ? dateLabel(value.date) : value.migrated ? 'Migrado · sem data conhecida (somente mensal)' : 'Sem data conhecida (somente mensal)'));
+        entry.append(text,el('strong','',currency(value.cents)),actionButton('edit','Editar lançamento '+value.id,{editMonthly:value.id}));node.append(entry);
+      }
     }
+    container.append(node);
   }
 }
 function normalize(value) { return value.normalize('NFD').replace(/[\u0300-\u036f]/gu, '').toLocaleLowerCase('pt-BR'); }
 function filteredRecords() {
   if (!state) return [];
   const search = normalize($('search').value.trim()); const kind = $('kind-filter').value;
-  return state.records.filter((record) => (kind === 'all' || record.kind === kind) && (!search || normalize(`${record.description} ${record.personName}`).includes(search)));
+  return state.records.filter((record) => (!$('category-filter').value || (record.kind === 'expense' && record.category === $('category-filter').value)) && (kind === 'all' || record.kind === kind) && (!search || normalize(`${record.description} ${record.personName} ${record.category}`).includes(search)));
 }
 function renderRecords() {
   const records = filteredRecords(); const shown = records.slice(0, visibleRecords); const container = $('records'); container.replaceChildren();
@@ -394,7 +472,7 @@ function renderRecords() {
   for (const record of shown) {
     const investment = record.kind === 'investment'; const node = el('article', `record ${investment ? 'investment' : ''}`); node.dataset.recordId = record.id;
     const title = el('div', 'record-title'); const mark = el('span', 'record-icon'); mark.append(icon(investment ? 'trend' : 'wallet'));
-    const description = el('div'); description.append(el('strong', '', record.description), el('small', '', record.personName)); title.append(mark, description);
+    const description = el('div'); description.append(el('strong', '', record.description), el('small', '', record.personName + (investment ? '' : ' · ' + record.category))); title.append(mark, description);
     const actions = el('div', 'actions'); actions.append(actionButton('edit', `Editar ${record.description}`, { editRecord: record.id }), actionButton('trash', `Remover ${record.description}`, { removeRecord: record.id })); actions.lastChild.classList.add('danger');
     node.append(title, el('span', 'record-date', dateLabel(record.date)), el('span', `kind ${investment ? 'investment' : ''}`, investment ? 'Aporte' : 'Gasto'), el('strong', 'record-money', currency(record.cents)), actions); container.append(node);
   }
@@ -421,28 +499,27 @@ function openRecord(record = null) {
   }
   $('record-kind').value = record?.kind || 'expense';
   $('record-description').value = record?.description || '';
+  $('record-category').value = record?.category === 'Sem categoria' ? '' : record?.category || '';
   $('record-value').value = record ? inputMoney(record.cents) : '';
   $('record-date').value = record?.date || (state.today.slice(0, 7) === state.month ? state.today : `${state.month}-01`);
   openDialog('record-dialog');
 }
-function monthlyValue(personId, kind) { return state?.monthlyValues.find((value) => value.personId === personId && value.kind === kind); }
 function syncMonthlyForm() {
-  if (!state) return;
-  const value = monthlyValue($('monthly-person').value, $('monthly-kind').value);
-  const salary = $('monthly-kind').value === 'salary';
-  setText('monthly-form-title', salary ? 'Salário do mês' : 'Fatura do cartão');
-  setText('monthly-form-context', `${monthLabel(monthlyContext.month)} · um valor por pessoa`);
-  $('monthly-amount').value = value ? inputMoney(value.cents) : '';
-  setText('monthly-existing', value ? `Valor atual: ${currency(value.cents)}. Salvar substitui este valor.` : 'Ainda não informado neste mês. Zero é um valor válido.');
-  setText('monthly-form-hint', salary ? 'O salário é uma receita deste mês. Ele não será copiado para os meses seguintes.' : 'A fatura é apenas um indicador separado. Não soma aos gastos, não reduz o saldo novamente e não indica pagamento.');
-  $('remove-monthly').hidden = !value;
-  formError($('monthly-form'));
+  if(!state) return;
+  const value=monthlyContext?.entry; const salary=$('monthly-kind').value==='salary';
+  setText('monthly-form-title',(value?'Editar ':'Adicionar ')+(salary?'recebimento':'fatura'));
+  setText('monthly-form-context',monthLabel(monthlyContext.month)+' · '+(value?'Somente este lançamento será alterado.':'Um novo lançamento será somado ao total.'));
+  setText('monthly-existing',value ? (value.migrated?'Valor migrado; preserve a data em branco se desconhecida.':'Editando o lançamento #'+value.id) : 'Adicionar soma. Use Editar na lista para corrigir um item. Zero é válido.');
+  setText('monthly-form-hint',salary?'Recebimentos deste mês se acumulam; não são copiados para outros meses.':'Fatura informativa: não soma aos gastos, não reduz o saldo novamente e não indica pagamento.');
+  $('remove-monthly').hidden=!value;
+  document.querySelector('#monthly-form button[type=submit]').textContent=value?'Salvar alterações':'Adicionar lançamento';
 }
-function openMonthly(kind, personId) {
-  if (!state) return;
-  monthlyContext = { month: state.month };
-  personOptions($('monthly-person'), personId || state.scope);
-  $('monthly-kind').value = kind;
+function openMonthly(kind,personId,entry=null) {
+  if(!state)return;
+  monthlyContext={month:state.month,entry}; $('monthly-form').reset();
+  personOptions($('monthly-person'),personId || state.scope,Boolean(entry));
+  $('monthly-kind').value=kind; $('monthly-amount').value=entry?inputMoney(entry.cents):'';
+  $('monthly-description').value=entry?.description || ''; $('monthly-date').value=entry?.date || '';
   syncMonthlyForm(); openDialog('monthly-dialog');
 }
 function openRemoval(record) {
@@ -481,16 +558,14 @@ function downloadCsv(rows, name) {
 }
 function exportRecords() {
   if (!state) return;
-  const rows = [['Data', 'Pessoa', 'Descrição', 'Tipo', 'Valor (R$)', 'Centavos', 'ID'], ...filteredRecords().map((record) => [record.date, record.personName, record.description, record.kind === 'investment' ? 'Aporte' : 'Gasto', inputMoney(record.cents), record.cents, record.id])];
+  const rows = [['Data', 'Pessoa', 'Categoria', 'Descrição', 'Tipo', 'Valor (R$)', 'Centavos', 'ID'], ...filteredRecords().map((record) => [record.date, record.personName, record.category, record.description, record.kind === 'investment' ? 'Aporte' : 'Gasto', inputMoney(record.cents), record.cents, record.id])];
   downloadCsv(rows, `lancamentos-${state.month}-${state.scope === 'all' ? 'casal' : 'individual'}.csv`);
   toast('CSV dos lançamentos filtrados exportado.');
 }
 function exportMonthly() {
   if (!state) return;
-  const rows = [['Mês', 'Pessoa', 'Tipo', 'Informado', 'Valor (R$)', 'Centavos', 'Pessoa ID']];
-  for (const person of state.people.filter((item) => state.participants.some((participant) => participant.id === item.id))) {
-    for (const [kind, label] of [['salary', 'Salário'], ['card', 'Fatura']]) rows.push([state.month, person.name, label, person[kind] === null ? 'Não' : 'Sim', inputMoney(person[kind]), person[kind] ?? '', person.id]);
-  }
+  const rows=[['Mês','Data conhecida','Pessoa','Tipo','Descrição','Valor (R$)','Centavos','ID','Migrado']];
+  for(const value of state.monthlyValues) rows.push([value.month,value.date || '',value.personName,value.kind==='salary'?'Salário':'Fatura',value.description || '',inputMoney(value.cents),value.cents,value.id,value.migrated?'Sim':'Não']);
   downloadCsv(rows, `valores-mensais-${state.month}-${state.scope === 'all' ? 'casal' : 'individual'}.csv`);
   toast('CSV dos salários e faturas exportado.');
 }
@@ -516,6 +591,7 @@ $('export-monthly-csv').addEventListener('click', exportMonthly);
 document.addEventListener('click', (event) => {
   const close = event.target.closest('[data-close]'); if (close && !close.disabled) closeDialog(close.dataset.close);
   const monthly = event.target.closest('button[data-monthly-kind]'); if (monthly) openMonthly(monthly.dataset.monthlyKind, monthly.dataset.personId);
+  const monthlyEdit=event.target.closest('[data-edit-monthly]'); if(monthlyEdit && state) { const value=state.monthlyValues.find(v=>v.id===Number(monthlyEdit.dataset.editMonthly)); if(value)openMonthly(value.kind,value.personId,value); }
   const edit = event.target.closest('[data-edit-record]'); if (edit && state) openRecord(state.records.find((record) => record.id === Number(edit.dataset.editRecord)));
   const remove = event.target.closest('[data-remove-record]'); if (remove && state) openRemoval(state.records.find((record) => record.id === Number(remove.dataset.removeRecord)));
 });
@@ -531,7 +607,7 @@ $('record-form').addEventListener('submit', (event) => {
   event.preventDefault(); submit(event.currentTarget, async () => {
     const description = $('record-description').value.trim();
     if (!description || description.length > 120 || /[\r\n]/u.test(description)) throw new Error('Informe uma descrição de até 120 caracteres.');
-    await api('/api/records', { id: editingRecord?.id ?? null, personId: $('record-person').value, kind: $('record-kind').value, description, cents: parseMoney($('record-value').value, { zero: false }), date: $('record-date').value });
+    await api('/api/records', { id: editingRecord?.id ?? null, personId: $('record-person').value, kind: $('record-kind').value, description, category: $('record-category').value.trim(), cents: parseMoney($('record-value').value, { zero: false }), date: $('record-date').value });
     await saved('record-dialog', editingRecord ? 'Lançamento atualizado.' : 'Lançamento registrado.');
   });
 });
@@ -549,23 +625,20 @@ $('goals-form').addEventListener('submit', (event) => {
 $('monthly-person').addEventListener('change', syncMonthlyForm); $('monthly-kind').addEventListener('change', syncMonthlyForm);
 $('monthly-form').addEventListener('submit', (event) => {
   event.preventDefault(); submit(event.currentTarget, async () => {
-    await api('/api/monthly-values', { month: monthlyContext.month, personId: $('monthly-person').value, kind: $('monthly-kind').value, cents: parseMoney($('monthly-amount').value) });
-    await saved('monthly-dialog', 'Valor mensal atualizado, sem acumular.');
+    await api('/api/monthly-values', { ...(monthlyContext.entry ? {id:monthlyContext.entry.id} : {}), month: monthlyContext.month, description:$('monthly-description').value.trim(),date:$('monthly-date').value || null, personId: $('monthly-person').value, kind: $('monthly-kind').value, cents: parseMoney($('monthly-amount').value) });
+    await saved('monthly-dialog', monthlyContext.entry ? 'Lançamento atualizado.' : 'Novo lançamento adicionado ao total.');
   });
 });
-$('remove-monthly').addEventListener('click', () => {
-  const personId = $('monthly-person').value; const kind = $('monthly-kind').value;
-  const value = monthlyValue(personId, kind); if (!value) return;
-  removal = { type: 'monthly', month: monthlyContext.month, personId, kind };
-  setText('remove-title', `Remover ${kind === 'salary' ? 'salário' : 'fatura'} informado?`);
-  setText('remove-context', `${value.personName} · ${monthLabel(monthlyContext.month)} · ${currency(value.cents)}. O valor passará a “não informado”. Os lançamentos de gastos e aportes serão mantidos.`);
-  openDialog('remove-dialog');
+$('remove-monthly').addEventListener('click',()=> {
+  const value=monthlyContext?.entry; if(!value)return;
+  removal={type:'monthly',id:value.id};setText('remove-title','Excluir este lançamento?');
+  setText('remove-context',value.personName+' · '+currency(value.cents)+'. Apenas este item sairá dos totais.');openDialog('remove-dialog');
 });
 $('remove-form').addEventListener('submit', (event) => {
   event.preventDefault(); submit(event.currentTarget, async () => {
     if (!removal) return;
     if (removal.type === 'record') await api('/api/records/remove', { id: removal.id });
-    else await api('/api/monthly-values/remove', { month: removal.month, personId: removal.personId, kind: removal.kind });
+    else await api('/api/monthly-values/remove', { id: removal.id });
     if (removal.type === 'monthly') closeDialog('monthly-dialog');
     await saved('remove-dialog', removal.type === 'record' ? 'Lançamento removido.' : 'Valor mensal removido.'); removal = null;
   });
@@ -581,9 +654,15 @@ $('theme-toggle').addEventListener('click', () => {
   const selected = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; applyTheme(selected);
   try { localStorage.setItem('gastos-theme', selected); } catch {}
 });
-document.querySelectorAll('.nav a').forEach((link) => link.addEventListener('click', () => {
-  document.querySelectorAll('.nav a').forEach((item) => item.removeAttribute('aria-current')); link.setAttribute('aria-current', 'location');
-}));
+document.querySelectorAll('[data-screen]').forEach(link=>link.addEventListener('click',event=>{event.preventDefault();switchScreen(link.dataset.screen); history.replaceState(null,'','#'+screen);$('page-title').setAttribute('tabindex','-1');$('page-title').focus({preventScroll:true});window.scrollTo({top:0,behavior:'instant'});}));
+$('category-filter').addEventListener('change',()=>{visibleRecords=20;renderRecords();renderBreakdown();});
+$('week-date').addEventListener('change',()=>{if($('week-date').value)loadState();});
+function moveWeek(days) { const d=new Date($('week-date').value+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+days);const value=d.toISOString().slice(0,10);if(value<'1900-01-08'||value>'2199-12-24')return;$('week-date').value=value;weekCategory='';loadState(); }
+$('previous-week').addEventListener('click',()=>moveWeek(-7));$('next-week').addEventListener('click',()=>moveWeek(7));
+$('current-week').addEventListener('click',()=>{$('week-date').value=localToday();weekCategory='';loadState();});
+$('clear-week-category').addEventListener('click',()=>{weekCategory='';renderWeekly();});
+function localToday() { const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());return ['year','month','day'].map(t=>parts.find(p=>p.type===t).value).join('-'); }
+$('week-date').value=localToday(); switchScreen(location.hash.slice(1));
 const todayParts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit' }).formatToParts(new Date());
 $('month').value = `${todayParts.find((part) => part.type === 'year').value}-${todayParts.find((part) => part.type === 'month').value}`;
 let chartResizeFrame;

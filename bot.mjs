@@ -15,9 +15,9 @@ const MAX_CENTS = 1_000_000_000_000;
 const HELP = [
   'Gastos: mercado 107,87 ou farmácia 40.',
   'Aportes: investimento CDB 200, aporte 150, reserva 200 ou reserva emergência 150,50.',
-  'Fatura: cartao 850,90 ou cartão 2026-10 850,90.',
-  'Receita: salario 3000 ou salário 2026-10 3000.',
-  'Salário e fatura: um valor por pessoa/mês; repetir atualiza, sem acumular. Zero é permitido. Sem mês, usa o mês da mensagem em São Paulo.',
+  'Fatura: cartao 850,90, fatura Nubank 300 ou cartão 2026-10 Visa 850,90.',
+  'Receita: salario 3000 ou salário 2026-10 Empresa 3000.',
+  'Cada salário e fatura adiciona um lançamento ao mês. Descrição opcional antes do valor. Zero é permitido. Sem mês, usa o mês da mensagem em São Paulo.',
   'A fatura é informativa: não entra nos gastos nem indica pagamento. Não registre seu pagamento novamente como gasto.',
   'Consultas: total mês, total 2026-10, listar ou listar 2026-10.',
   'Outros: desfazer e ajuda. Desfazer remove somente seu último gasto/aporte; edite ou remova salário e fatura na dashboard.',
@@ -34,7 +34,7 @@ function normalized(value) {
 function specificCommand(value) {
   // Dígitos encostados no comando indicam uma mensagem incompleta/malformada,
   // não uma descrição de despesa (ex.: cartao2026-10 850).
-  return normalized(value).match(/^(reserva|investimento|aporte|cartao|salario|total|listar)(?=$|[^\p{L}_])/u)?.[1];
+  return normalized(value).match(/^(reserva|investimento|aporte|cartao|fatura|salario|total|listar)(?=$|[^\p{L}_])/u)?.[1];
 }
 
 export function money(cents) {
@@ -84,7 +84,7 @@ export function parseEntry(input) {
   if (typeof input !== 'string' || /[\r\n]/u.test(input)) return null;
   const command = specificCommand(input);
   // A palavra reservada nunca deve ser reconhecida como descrição de um gasto.
-  if (['cartao', 'salario'].includes(command)) return null;
+  if (['cartao', 'fatura', 'salario'].includes(command)) return null;
   const investment = input.trim().match(/^(investimento|aporte|reserva)\s+(.+)$/iu);
   if (command && !investment) return null;
   const fallback = command === 'reserva' ? 'Reserva' : 'Investimento';
@@ -101,14 +101,21 @@ export function parseEntry(input) {
 
 export function parseMonthlyValue(input, instant = new Date()) {
   if (typeof input !== 'string' || /[\r\n]/u.test(input)) return null;
-  const match = normalized(input).match(/^(cartao|salario)\s+(?:(\d{4}-\d{2})\s+)?(.+)$/u);
+  const match = normalized(input).match(/^(cartao|fatura|salario)\s+(?:(\d{4}-\d{2})\s+)?(.+)$/u);
   if (!match) return null;
   const month = match[2] || dateFor(instant).slice(0, 7);
   // Lê o texto original para preservar R$ e o formato monetário.
   const amount = input.trim().replace(/^\S+\s+/u, '').replace(/^\d{4}-\d{2}\s+/u, '');
-  const cents = parseMoney(amount, { allowZero: true });
+  let cents = parseMoney(amount, { allowZero: true });
+  let description;
+  if (cents === null) {
+    const parts = amount.match(/^(.+?)\s+(?:R\$\s*)?(\d[\d.,]*)$/u);
+    if (!parts || !/\p{L}/u.test(parts[1]) || parts[1].length > 120 || /^\d{4}-/u.test(parts[1]) || /(?:^|\s)-\d/u.test(parts[1])) return null;
+    description = parts[1].trim();
+    cents = parseMoney(parts[2], { allowZero: true });
+  }
   if (!validMonth(month) || cents === null) return null;
-  return { kind: match[1] === 'salario' ? 'salary' : 'card', month, cents };
+  return { kind: match[1] === 'salario' ? 'salary' : 'card', month, cents, ...(description ? { description } : {}) };
 }
 
 export function openDb(path) {
@@ -143,6 +150,7 @@ export function openDb(path) {
     if (!columns.some((column) => column.name === 'kind')) {
       db.exec("ALTER TABLE expenses ADD COLUMN kind TEXT NOT NULL DEFAULT 'expense' CHECK (kind IN ('expense', 'investment'))");
     }
+    if (!columns.some((column) => column.name === 'category')) db.exec('ALTER TABLE expenses ADD COLUMN category TEXT');
     db.exec(`CREATE TABLE IF NOT EXISTS monthly_goals (
     group_id TEXT NOT NULL,
     month TEXT NOT NULL,
@@ -163,7 +171,24 @@ export function openDb(path) {
     );
     INSERT OR IGNORE INTO processed_messages (group_id, message_id, actor_id, processed_at)
       SELECT group_id, message_id, actor_id, created_at FROM expenses;
-    COMMIT`);
+    `);
+    // The legacy timestamp is an update time, never evidence of a receipt date.
+    if (!db.prepare('PRAGMA table_info(monthly_values)').all().some((column) => column.name === 'id')) {
+      db.exec(`ALTER TABLE monthly_values RENAME TO monthly_values_legacy_v1;
+        CREATE TABLE monthly_values (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, month TEXT NOT NULL,
+          actor_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('salary','card')),
+          amount_cents INTEGER NOT NULL CHECK (typeof(amount_cents) = 'integer' AND amount_cents BETWEEN 0 AND 1000000000000),
+          updated_at TEXT NOT NULL, description TEXT, entry_date TEXT, message_id TEXT,
+          migrated INTEGER NOT NULL DEFAULT 0 CHECK (migrated IN (0,1)), deleted_at TEXT,
+          UNIQUE (group_id, message_id, actor_id)
+        );
+        INSERT INTO monthly_values (group_id,month,actor_id,kind,amount_cents,updated_at,migrated)
+          SELECT group_id,month,actor_id,kind,amount_cents,updated_at,1 FROM monthly_values_legacy_v1;
+        CREATE INDEX monthly_entries_period ON monthly_values(group_id,month,actor_id);
+      `);
+    }
+    db.exec('PRAGMA user_version = 2; COMMIT');
     return db;
   } catch (error) {
     if (db.isTransaction) db.exec('ROLLBACK');
@@ -172,24 +197,26 @@ export function openDb(path) {
   }
 }
 
-export function setMonthlyValue(db, { groupId, month, actorId, kind, amountCents, updatedAt = new Date().toISOString() }) {
+export function setMonthlyValue(db, { groupId, month, actorId, kind, amountCents, updatedAt = new Date().toISOString(), description = null, date = null, messageId = null }) {
+  const parsedDate = typeof date === 'string' ? new Date(`${date}T12:00:00Z`) : null;
+  const validDate = date === null || (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/u.test(date)
+    && date.slice(0, 7) === month && Number.isFinite(parsedDate.getTime()) && parsedDate.toISOString().slice(0, 10) === date);
   if (typeof groupId !== 'string' || !groupId || typeof actorId !== 'string' || !actorId
     || !validMonth(month) || !['salary', 'card'].includes(kind)
-    || !Number.isSafeInteger(amountCents) || amountCents < 0 || amountCents > MAX_CENTS) {
+    || !Number.isSafeInteger(amountCents) || amountCents < 0 || amountCents > MAX_CENTS
+    || (description !== null && (typeof description !== 'string' || description.length > 120 || /[\r\n]/u.test(description)))
+    || !validDate) {
     throw new TypeError('Pessoa, mês, tipo ou valor mensal inválido.');
   }
-  // O savepoint mantém o cadastro/atualização atômico inclusive dentro de processText.
+  // O savepoint mantém a inclusão atômica inclusive dentro de processText.
   db.exec('SAVEPOINT monthly_value_write');
   try {
-    const inserted = db.prepare(`INSERT INTO monthly_values (group_id, month, actor_id, kind, amount_cents, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (group_id, month, actor_id, kind) DO NOTHING`).run(
-      groupId, month, actorId, kind, amountCents, updatedAt,
+    const inserted = db.prepare(`INSERT INTO monthly_values (group_id, month, actor_id, kind, amount_cents, updated_at, description, entry_date, message_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      groupId, month, actorId, kind, amountCents, updatedAt, description, date, messageId,
     );
-    const created = inserted.changes === 1;
-    if (!created) db.prepare(`UPDATE monthly_values SET amount_cents = ?, updated_at = ?
-      WHERE group_id = ? AND month = ? AND actor_id = ? AND kind = ?`).run(amountCents, updatedAt, groupId, month, actorId, kind);
     db.exec('RELEASE monthly_value_write');
-    return { created };
+    return { created: true, id: Number(inserted.lastInsertRowid) };
   } catch (error) {
     db.exec('ROLLBACK TO monthly_value_write; RELEASE monthly_value_write');
     throw error;
@@ -203,7 +230,7 @@ export function processText(db, event) {
   const command = normalized(text);
   const specific = specificCommand(text);
   const report = command.match(/^(total|listar)(?:\s+(mes|(?:19|20|21)\d{2}-(?:0[1-9]|1[0-2])))?$/u);
-  const monthly = ['cartao', 'salario'].includes(specific) ? parseMonthlyValue(text, instant) : null;
+  const monthly = ['cartao', 'fatura', 'salario'].includes(specific) ? parseMonthlyValue(text, instant) : null;
   const expense = report || monthly ? null : parseEntry(text);
   if (!report && !expense && !monthly && !specific && !['desfazer', 'ajuda'].includes(command)) return null;
   const month = report && report[2] && report[2] !== 'mes' ? report[2] : dateFor(instant).slice(0, 7);
@@ -215,11 +242,12 @@ export function processText(db, event) {
     if (prior) { db.exec('COMMIT'); return null; }
     let reply;
     if (monthly) {
-      const { created } = setMonthlyValue(db, {
+      setMonthlyValue(db, {
         groupId, month: monthly.month, actorId: person.id, kind: monthly.kind, amountCents: monthly.cents, updatedAt: stamp,
+        description: monthly.description || null, date: dateFor(instant).slice(0,7) === monthly.month ? dateFor(instant) : null, messageId,
       });
       const salary = monthly.kind === 'salary';
-      reply = `${salary ? 'Salário' : 'Fatura'} ${salary ? (created ? 'cadastrado' : 'atualizado') : (created ? 'cadastrada' : 'atualizada')} para ${person.name}:\nMês: ${monthly.month}\nValor: ${money(monthly.cents)}`;
+      reply = `${salary ? 'Salário cadastrado' : 'Fatura cadastrada'} para ${person.name}:\nMês: ${monthly.month}\nValor: ${money(monthly.cents)}${monthly.description ? `\nDescrição: ${monthly.description}` : ''}\nNovo lançamento adicionado ao total do mês.`;
       if (!salary) reply += '\nFatura informativa: não soma aos gastos e não indica pagamento. Não registre seu pagamento novamente como gasto.';
     } else if (expense) {
       db.prepare(`INSERT INTO expenses
@@ -256,13 +284,13 @@ export function processText(db, event) {
       } else reply = `${person.name}, você não tem gastos para desfazer.`;
     } else if (specific) {
       const consultation = ['total', 'listar'].includes(specific);
-      const examples = specific === 'cartao' ? 'cartao 850,90 ou cartão 2026-10 850,90'
+      const examples = ['cartao', 'fatura'].includes(specific) ? 'cartao 850,90 ou fatura 2026-10 Visa 850,90'
         : specific === 'salario' ? 'salario 3000 ou salário 2026-10 3000'
           : specific === 'reserva' ? 'reserva 200 ou reserva emergência 150,50'
             : consultation ? `${specific} mês ou ${specific} 2026-10`
             : `${specific} 200 ou ${specific} CDB 200`;
       const instruction = consultation ? 'Informe um mês válido (AAAA-MM) ou use mês para consultar o mês atual.'
-        : ['cartao', 'salario'].includes(specific) ? 'Informe um valor igual ou maior que zero e um mês válido (AAAA-MM).'
+        : ['cartao', 'fatura', 'salario'].includes(specific) ? 'Informe um valor igual ou maior que zero e um mês válido (AAAA-MM).'
           : 'Informe um valor maior que zero.';
       reply = `Comando inválido. Use: ${examples}.\n${instruction} Nenhum valor foi registrado.`;
     } else reply = HELP;
